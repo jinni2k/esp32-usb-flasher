@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter_libserialport/flutter_libserialport.dart';
+import 'package:usb_serial/usb_serial.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'dart:io';
 import 'dart:typed_data';
@@ -35,8 +35,8 @@ class FlasherScreen extends StatefulWidget {
 class _FlasherScreenState extends State<FlasherScreen> {
   String? _selectedFilePath;
   String? _detectedChip;
-  String? _selectedPort;
-  List<String> _availablePorts = [];
+  UsbDevice? _selectedDevice;
+  List<UsbDevice> _availableDevices = [];
   bool _isScanning = false;
   bool _isFlashing = false;
   double _flashProgress = 0.0;
@@ -47,6 +47,11 @@ class _FlasherScreenState extends State<FlasherScreen> {
     super.initState();
     _requestPermissions();
     _scanPorts();
+    
+    // Listen for USB device events
+    UsbSerial.usbEventStream?.listen((UsbEvent event) {
+      _scanPorts();
+    });
   }
 
   Future<void> _requestPermissions() async {
@@ -65,13 +70,13 @@ class _FlasherScreenState extends State<FlasherScreen> {
     });
 
     try {
-      final ports = SerialPort.availablePorts;
+      final devices = await UsbSerial.listDevices();
       setState(() {
-        _availablePorts = ports;
+        _availableDevices = devices;
         _isScanning = false;
-        _statusMessage = ports.isEmpty 
+        _statusMessage = devices.isEmpty 
           ? 'No USB devices found. Connect ESP32 and try again.'
-          : 'Found ${ports.length} USB device(s)';
+          : 'Found ${devices.length} USB device(s)';
       });
     } catch (e) {
       setState(() {
@@ -81,26 +86,24 @@ class _FlasherScreenState extends State<FlasherScreen> {
     }
   }
 
-  Future<void> _detectChip(String portName) async {
+  Future<void> _detectChip(UsbDevice device) async {
     setState(() {
-      _statusMessage = 'Detecting chip type on $portName...';
+      _statusMessage = 'Detecting chip type on ${device.productName}...';
     });
 
     try {
-      final port = SerialPort(portName);
-      
-      // Configure port for ESP32 communication
-      final config = SerialPortConfig();
-      config.baudRate = 115200;
-      config.bits = 8;
-      config.parity = SerialPortParity.none;
-      config.stopBits = 1;
-      port.config = config;
-
-      final opened = port.openReadWrite();
-      if (!opened) {
-        throw Exception('Failed to open port: ${SerialPort.lastError}');
+      final port = await device.create();
+      if (port == null) {
+        throw Exception('Failed to create port');
       }
+      
+      final opened = await port.open();
+      if (!opened) {
+        throw Exception('Failed to open port');
+      }
+
+      // Configure port for ESP32 communication
+      await port.setPortParameters(115200, UsbPort.DATABITS_8, UsbPort.STOPBITS_1, UsbPort.PARITY_NONE);
 
       // Try to detect chip by sending reset and checking response
       // First, send sync command (0x07 0x07 0x12 0x20)
@@ -111,20 +114,20 @@ class _FlasherScreenState extends State<FlasherScreen> {
       
       // Try to read any response
       try {
-        final response = port.read(128);
-        if (response.isNotEmpty) {
+        final response = await port.inputStream?.first;
+        if (response != null && response.isNotEmpty) {
           // ESP32 typically responds with specific patterns
           // This is a simplified detection - real detection would be more complex
           setState(() {
             _detectedChip = 'ESP32'; // Default to ESP32 for now
-            _statusMessage = 'Detected ESP32 on $portName';
+            _statusMessage = 'Detected ESP32 on ${device.productName}';
           });
         }
       } catch (e) {
         // If no response, still assume ESP32 might be connected
         setState(() {
           _detectedChip = 'ESP32';
-          _statusMessage = 'ESP32 detected on $portName (no response received)';
+          _statusMessage = 'ESP32 detected on ${device.productName} (no response received)';
         });
       }
       
@@ -175,8 +178,10 @@ class _FlasherScreenState extends State<FlasherScreen> {
   }
 
   Future<void> _flashFirmware() async {
-    if (_selectedPort == null || _selectedFilePath == null) {
-      _showError('Please select a USB port and firmware file');
+    final selectedDevice = _selectedDevice;
+    
+    if (selectedDevice == null || _selectedFilePath == null) {
+      _showError('Please select a USB device and firmware file');
       return;
     }
 
@@ -190,20 +195,18 @@ class _FlasherScreenState extends State<FlasherScreen> {
       final file = File(_selectedFilePath!);
       final firmwareBytes = await file.readAsBytes();
       
-      final port = SerialPort(_selectedPort!);
-      
-      // Configure port for high-speed flashing
-      final config = SerialPortConfig();
-      config.baudRate = 460800;  // High speed for flashing
-      config.bits = 8;
-      config.parity = SerialPortParity.none;
-      config.stopBits = 1;
-      port.config = config;
-
-      final opened = port.openReadWrite();
-      if (!opened) {
-        throw Exception('Failed to open port: ${SerialPort.lastError}');
+      final port = await selectedDevice.create();
+      if (port == null) {
+        throw Exception('Failed to create port');
       }
+      
+      final opened = await port.open();
+      if (!opened) {
+        throw Exception('Failed to open port');
+      }
+
+      // Configure port for high-speed flashing
+      await port.setPortParameters(460800, UsbPort.DATABITS_8, UsbPort.STOPBITS_1, UsbPort.PARITY_NONE);
 
       setState(() {
         _statusMessage = 'Connected to $_detectedChip. Preparing to flash...';
@@ -319,22 +322,22 @@ class _FlasherScreenState extends State<FlasherScreen> {
                       ],
                     ),
                     const SizedBox(height: 12),
-                    if (_availablePorts.isNotEmpty) ...[
-                      DropdownButtonFormField<String>(
-                        value: _selectedPort,
+                    if (_availableDevices.isNotEmpty) ...[
+                      DropdownButtonFormField<UsbDevice>(
+                        value: _selectedDevice,
                         decoration: const InputDecoration(
-                          labelText: 'Select USB Port',
+                          labelText: 'Select USB Device',
                           border: OutlineInputBorder(),
                         ),
-                        items: _availablePorts.map((port) {
+                        items: _availableDevices.map((device) {
                           return DropdownMenuItem(
-                            value: port,
-                            child: Text(port),
+                            value: device,
+                            child: Text(device.productName ?? 'Unknown Device'),
                           );
                         }).toList(),
                         onChanged: (value) {
                           setState(() {
-                            _selectedPort = value;
+                            _selectedDevice = value;
                           });
                           if (value != null) {
                             _detectChip(value);
@@ -430,7 +433,7 @@ class _FlasherScreenState extends State<FlasherScreen> {
             
             // Flash Button
             ElevatedButton.icon(
-              onPressed: (_selectedPort == null || _selectedFilePath == null || _isFlashing) 
+              onPressed: (_selectedDevice == null || _selectedFilePath == null || _isFlashing) 
                 ? null 
                 : _flashFirmware,
               icon: _isFlashing 
